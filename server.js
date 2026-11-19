@@ -11,18 +11,11 @@ const requestNumberPattern = /^[A-Z]{2}-\d{8}-\d{3}$/;
 
 function makePoolConfig() {
   if (process.env.DATABASE_URL) {
-    return {
-      connectionString: process.env.DATABASE_URL,
-      ssl: { rejectUnauthorized: false }
-    };
+    return { connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } };
   }
-
   return {
-    host: process.env.DB_HOST,
-    port: Number(process.env.DB_PORT) || 5432,
-    database: process.env.DB_NAME,
-    user: process.env.DB_USER,
-    password: process.env.DB_PASSWORD,
+    host: process.env.DB_HOST, port: Number(process.env.DB_PORT) || 5432, database: process.env.DB_NAME,
+    user: process.env.DB_USER, password: process.env.DB_PASSWORD,
     ssl: process.env.DB_HOST ? { rejectUnauthorized: false } : undefined
   };
 }
@@ -55,53 +48,52 @@ function validateRequest(body) {
   const serviceDate = cleanText(body.serviceDate, 10);
   const comment = cleanText(body.comment, 500);
   const baggageCount = Number(body.baggageCount);
-
   if (passengerName.length < 2) return { error: 'Укажите имя пассажира (минимум 2 символа).' };
   if (!/^[+\d()\-\s]{7,30}$/.test(contactPhone)) return { error: 'Укажите корректный контактный телефон.' };
   if (!/^[A-Z0-9]{2,10}$/.test(flightNumber)) return { error: 'Номер рейса: 2–10 латинских букв или цифр.' };
   if (!serviceTypes.has(serviceType)) return { error: 'Выберите услугу из списка.' };
   if (!isIsoDate(serviceDate)) return { error: 'Дата должна быть в формате ГГГГ-ММ-ДД.' };
   if (!Number.isInteger(baggageCount) || baggageCount < 0 || baggageCount > 10) return { error: 'Количество мест багажа — целое число от 0 до 10.' };
-
   return { value: { passengerName, contactPhone, flightNumber, serviceType, serviceDate, baggageCount, comment: comment || null } };
 }
 
 app.use(express.json({ limit: '32kb' }));
 app.use(express.static(path.join(__dirname, 'public')));
-
 app.get('/', (_req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
 app.get('/healthz', (_req, res) => res.type('text').send('ok'));
 
 app.get('/api/health', async (_req, res) => {
+  try { await pool.query('SELECT 1'); res.json({ ok: true }); }
+  catch (error) { console.error('Database health check failed:', error.message); res.status(500).json({ ok: false, error: 'База данных недоступна.' }); }
+});
+
+// Read-only de-identified input for the AnyLogic airport model.
+app.get('/api/simulation/input', async (req, res) => {
+  const serviceDate = cleanText(req.query.date, 10);
+  if (serviceDate && !isIsoDate(serviceDate)) return res.status(400).json({ error: 'Параметр date должен быть в формате ГГГГ-ММ-ДД.' });
   try {
-    await pool.query('SELECT 1');
-    res.json({ ok: true });
+    const result = await pool.query(
+      `select request_number, flight_number, service_type, to_char(service_date, 'YYYY-MM-DD') as service_date, baggage_count, status, created_at from app_data.requests where ($1::date is null or service_date = $1::date) order by service_date, created_at`,
+      [serviceDate || null]
+    );
+    const rows = result.rows.map((row, index) => ({ id: row.request_number, sequence: index + 1, flightNumber: row.flight_number, serviceType: row.service_type, serviceDate: row.service_date, baggageCount: row.baggage_count, status: row.status, createdAt: row.created_at }));
+    return res.json({ generatedAt: new Date().toISOString(), source: 'Supabase app_data.requests', requestedDate: serviceDate || null, totalRequests: rows.length, requests: rows });
   } catch (error) {
-    console.error('Database health check failed:', error.message);
-    res.status(500).json({ ok: false, error: 'База данных недоступна.' });
+    console.error('Simulation input query failed:', error.message);
+    return res.status(500).json({ error: 'Не удалось подготовить данные для модели.' });
   }
 });
 
 app.post('/api/requests', async (req, res) => {
   const checked = validateRequest(req.body || {});
   if (checked.error) return res.status(400).json({ error: checked.error });
-
   const values = checked.value;
-  const sql = `insert into app_data.requests
-    (request_number, passenger_name, contact_phone, flight_number, service_type, service_date, baggage_count, comment)
-    values ($1, $2, $3, $4, $5, $6, $7, $8)
-    returning request_number, status, to_char(service_date, 'YYYY-MM-DD') as service_date`;
-
+  const sql = `insert into app_data.requests (request_number, passenger_name, contact_phone, flight_number, service_type, service_date, baggage_count, comment) values ($1, $2, $3, $4, $5, $6, $7, $8) returning request_number, status, to_char(service_date, 'YYYY-MM-DD') as service_date`;
   for (let attempt = 0; attempt < 3; attempt += 1) {
     const requestNumber = buildRequestNumber();
     try {
       const result = await pool.query(sql, [requestNumber, values.passengerName, values.contactPhone, values.flightNumber, values.serviceType, values.serviceDate, values.baggageCount, values.comment]);
-      return res.status(201).json({
-        message: 'Заявка успешно принята.',
-        requestNumber: result.rows[0].request_number,
-        status: result.rows[0].status,
-        serviceDate: result.rows[0].service_date
-      });
+      return res.status(201).json({ message: 'Заявка успешно принята.', requestNumber: result.rows[0].request_number, status: result.rows[0].status, serviceDate: result.rows[0].service_date });
     } catch (error) {
       if (error.code === '23505' && attempt < 2) continue;
       console.error('Request creation failed:', error.message);
@@ -113,21 +105,11 @@ app.post('/api/requests', async (req, res) => {
 app.get('/api/requests/:requestNumber', async (req, res) => {
   const requestNumber = cleanText(req.params.requestNumber, 15).toUpperCase();
   if (!requestNumberPattern.test(requestNumber)) return res.status(400).json({ error: 'Некорректный номер заявки.' });
-
   try {
-    const result = await pool.query(
-      `select request_number, flight_number, service_type,
-        to_char(service_date, 'YYYY-MM-DD') as service_date,
-        baggage_count, status, created_at
-       from app_data.requests where request_number = $1`,
-      [requestNumber]
-    );
+    const result = await pool.query(`select request_number, flight_number, service_type, to_char(service_date, 'YYYY-MM-DD') as service_date, baggage_count, status, created_at from app_data.requests where request_number = $1`, [requestNumber]);
     if (result.rowCount === 0) return res.status(404).json({ error: 'Заявка не найдена.' });
     return res.json(result.rows[0]);
-  } catch (error) {
-    console.error('Request lookup failed:', error.message);
-    return res.status(500).json({ error: 'Не удалось выполнить поиск.' });
-  }
+  } catch (error) { console.error('Request lookup failed:', error.message); return res.status(500).json({ error: 'Не удалось выполнить поиск.' }); }
 });
 
 app.use((error, _req, res, _next) => {
@@ -135,5 +117,4 @@ app.use((error, _req, res, _next) => {
   console.error('Unexpected server error:', error.message);
   return res.status(500).json({ error: 'Внутренняя ошибка сервера.' });
 });
-
 app.listen(port, () => console.log(`Airport service portal running on port ${port}`));
