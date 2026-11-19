@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: airport-service-portal
+    runtime: node
+    plan: free
+    buildCommand: npm ci
+    startCommand: npm run start
+    healthCheckPath: /healthz
+    envVars:
+      - key: NODE_VERSION
+        value: 20
+      - key: DATABASE_URL
+        sync: false
